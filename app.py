@@ -41,6 +41,81 @@ import yaml
 import winsound
 import sys
 
+# Invalidate stale Torch/Triton generated kernels instead of loading incompatible
+# cached Python from a previous runtime and crashing inside Inductor internals.
+COMPILE_CACHE_META = os.path.join(COMPILE_CACHE_DIR, "fish_compile_cache_meta.json")
+
+
+def _get_compile_cache_signature():
+    signature = {
+        "torch": getattr(torch, "__version__", "unknown"),
+        "cuda": getattr(torch.version, "cuda", None),
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+    }
+
+    try:
+        import triton
+        signature["triton"] = getattr(triton, "__version__", "unknown")
+    except Exception:
+        signature["triton"] = None
+
+    if torch.cuda.is_available():
+        try:
+            device_index = torch.cuda.current_device()
+            signature["cuda_device_capability"] = torch.cuda.get_device_capability(device_index)
+            signature["cuda_device_name"] = torch.cuda.get_device_name(device_index)
+        except Exception as exc:
+            signature["cuda_device_error"] = str(exc)
+
+    return signature
+
+
+def _compile_cache_has_kernels():
+    try:
+        return any(
+            filename.endswith((".py", ".ptx", ".cubin", ".json"))
+            for _, _, filenames in os.walk(COMPILE_CACHE_DIR)
+            for filename in filenames
+        )
+    except Exception:
+        return False
+
+
+def _clear_compile_cache():
+    for name in os.listdir(COMPILE_CACHE_DIR):
+        path = os.path.join(COMPILE_CACHE_DIR, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as exc:
+            print(f"[Fish Speech] Could not remove stale compile cache item {path}: {exc}")
+
+
+def _validate_compile_cache():
+    signature = _get_compile_cache_signature()
+    previous_signature = None
+
+    try:
+        with open(COMPILE_CACHE_META, "r", encoding="utf-8") as f:
+            previous_signature = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    if _compile_cache_has_kernels() and previous_signature != signature:
+        print("[Fish Speech] Torch/Triton runtime changed or cache metadata is missing; clearing stale compiled kernels.")
+        _clear_compile_cache()
+
+    try:
+        with open(COMPILE_CACHE_META, "w", encoding="utf-8") as f:
+            json.dump(signature, f, sort_keys=True, indent=2)
+    except OSError as exc:
+        print(f"[Fish Speech] Could not write compile cache metadata: {exc}")
+
+
+_validate_compile_cache()
+
 # s2.cpp executable discovery
 def _configured_s2_executable():
     """Return an optional s2.exe path from config.py without requiring it."""
@@ -403,7 +478,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
             # Check for existing cache to provide feedback
             has_cache = False
             try:
-                if os.path.exists(CACHE_DIR) and any(os.scandir(CACHE_DIR)):
+                if os.path.exists(COMPILE_CACHE_DIR) and any(os.scandir(COMPILE_CACHE_DIR)):
                     has_cache = True
             except: pass
 
