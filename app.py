@@ -41,6 +41,13 @@ import yaml
 import winsound
 import sys
 
+if os.name == "nt":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 # Invalidate stale Torch/Triton generated kernels instead of loading incompatible
 # cached Python from a previous runtime and crashing inside Inductor internals.
 COMPILE_CACHE_META = os.path.join(COMPILE_CACHE_DIR, "fish_compile_cache_meta.json")

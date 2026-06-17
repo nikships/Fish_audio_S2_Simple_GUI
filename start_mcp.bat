@@ -8,6 +8,8 @@ set OMP_PROC_BIND=TRUE
 set OMP_PLACES=CORES
 set OMP_WAIT_POLICY=PASSIVE
 set KMP_BLOCKTIME=0
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 :: Network binding configuration.
 :: Keep 127.0.0.1 when exposing through cloudflared.
