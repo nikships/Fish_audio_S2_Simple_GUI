@@ -36,6 +36,7 @@ if exist "%MCP_ENV_FILE%" (
 )
 
 if "%FISH_MCP_USERNAME%"=="" set "FISH_MCP_USERNAME=fish"
+if "%FISH_MCP_PUBLIC_HOSTS%"=="" set "FISH_MCP_PUBLIC_HOSTS=mcp.thethirdroom.xyz"
 if "%FISH_MCP_PASSWORD%"=="" (
     echo Creating local MCP password in .env...
     for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$bytes = [byte[]]::new(24); [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); [Convert]::ToBase64String($bytes)"`) do set "FISH_MCP_PASSWORD=%%P"

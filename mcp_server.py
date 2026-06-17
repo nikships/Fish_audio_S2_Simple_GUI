@@ -468,6 +468,27 @@ def _run_http(transport: str, host: str, port: int, username: str, password: str
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+def _allow_public_hosts():
+    public_hosts = [
+        item.strip()
+        for item in os.environ.get("FISH_MCP_PUBLIC_HOSTS", "mcp.thethirdroom.xyz").split(",")
+        if item.strip()
+    ]
+    security = mcp.settings.transport_security
+    if not security or not public_hosts:
+        return
+
+    allowed_hosts = set(security.allowed_hosts)
+    allowed_origins = set(security.allowed_origins)
+    for host in public_hosts:
+        allowed_hosts.add(host)
+        allowed_hosts.add(f"{host}:443")
+        allowed_origins.add(f"https://{host}")
+
+    security.allowed_hosts = sorted(allowed_hosts)
+    security.allowed_origins = sorted(allowed_origins)
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Fish Speech S2 Pro MCP server")
@@ -493,6 +514,7 @@ if __name__ == "__main__":
     else:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        _allow_public_hosts()
         password = os.environ.get(args.password_env, "")
         if not password and not args.allow_no_auth:
             sys.stderr.write(f"Set {args.password_env} before exposing HTTP MCP, or pass --allow-no-auth.\n")
