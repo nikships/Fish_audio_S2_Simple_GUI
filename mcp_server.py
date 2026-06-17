@@ -1,24 +1,82 @@
 """Minimal MCP server for Fish Speech S2 Pro GUI.
 
-Exposes a small, focused tool set (6 tools) for TTS synthesis and voice-sample
+Exposes a small, focused tool set (7 tools) for TTS synthesis and voice-sample
 preparation. Run alongside the Gradio app (start.bat) or standalone:
 
     uv pip install mcp[cli]
+    set FISH_MCP_PASSWORD=<strong password>
     .venv\\Scripts\\python.exe mcp_server.py
 
-Then point your MCP client at this command. For HTTP/SSE transport see
-`fastmcp run mcp_server.py --transport sse --host 127.0.0.1 --port 8765`.
+For internet exposure, keep this server bound to 127.0.0.1 and put Cloudflare
+Tunnel in front of it. Clients must send HTTP Basic auth:
+
+    Authorization: Basic base64(fish:<FISH_MCP_PASSWORD>)
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
+import binascii
+import hmac
 import os
+import re
 import sys
 import threading
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+SAMPLES_DIR = os.path.join(ROOT, "samples")
+OUTPUTS_DIR = os.path.join(ROOT, "outputs")
+ALLOWED_AUDIO_DIRS = (SAMPLES_DIR, OUTPUTS_DIR)
+SUPPORTED_AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+SAMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9_ -]{1,80}$")
+
+
+class BasicAuthMiddleware:
+    """Small ASGI Basic Auth middleware for Streamable HTTP/SSE transports."""
+
+    def __init__(self, app, username: str, password: str):
+        self.app = app
+        self.username = username.encode("utf-8")
+        self.password = password.encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or self._authorized(scope):
+            await self.app(scope, receive, send)
+            return
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"www-authenticate", b'Basic realm="fish-mcp"'),
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"Unauthorized"})
+
+    def _authorized(self, scope) -> bool:
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization", b"")
+        prefix = b"basic "
+        if not auth.lower().startswith(prefix):
+            return False
+        try:
+            decoded = base64.b64decode(auth[len(prefix) :], validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+        username, sep, password = decoded.partition(":")
+        if not sep:
+            return False
+        return hmac.compare_digest(username.encode("utf-8"), self.username) and hmac.compare_digest(
+            password.encode("utf-8"), self.password
+        )
 
 
 class _NoopProgress:
@@ -43,6 +101,41 @@ def _app():
     return _app_module
 
 
+def _clean_sample_name(sample_name: str) -> str:
+    name = (sample_name or "").strip()
+    if not name:
+        raise ValueError("sample_name must not be empty")
+    if not SAMPLE_NAME_RE.fullmatch(name):
+        raise ValueError("sample_name may only contain letters, numbers, spaces, underscores, and hyphens")
+    return name.replace(" ", "_")
+
+
+def _sample_audio_path(sample_name: str) -> str:
+    name = _clean_sample_name(sample_name)
+    path = os.path.abspath(os.path.join(SAMPLES_DIR, f"{name}.wav"))
+    if not path.startswith(os.path.abspath(SAMPLES_DIR) + os.sep):
+        raise ValueError("sample path escaped samples directory")
+    return path
+
+
+def _safe_audio_path(path: str, *, must_exist: bool = True, writable: bool = False) -> str:
+    if not path:
+        raise ValueError("audio path must not be empty")
+
+    absolute = os.path.abspath(path)
+    allowed = [os.path.abspath(d) + os.sep for d in ALLOWED_AUDIO_DIRS]
+    in_allowed_dir = any(absolute.startswith(root) for root in allowed)
+    if not in_allowed_dir:
+        raise ValueError("audio path must be under samples/ or outputs/")
+    if os.path.splitext(absolute)[1].lower() not in SUPPORTED_AUDIO_EXTS:
+        raise ValueError(f"audio path must end with one of: {', '.join(SUPPORTED_AUDIO_EXTS)}")
+    if must_exist and not os.path.isfile(absolute):
+        raise FileNotFoundError(f"audio path not found: {absolute!r}")
+    if writable and not os.access(absolute, os.W_OK):
+        raise PermissionError(f"audio path is not writable: {absolute!r}")
+    return absolute
+
+
 # ------- Prewarm: load + compile the PyTorch model in the background so the
 # first synthesize_tts / transcribe_audio / etc. call is fast. We serialize
 # every PyTorch-using tool behind _init_lock so a real MCP request blocks
@@ -64,13 +157,11 @@ def _start_prewarm():
     def _run():
         print("[prewarm] Starting PyTorch model warmup...", flush=True)
         try:
-            # Pick the first .wav in samples/ as a reference. If none, skip.
-            samples_dir = os.path.join(ROOT, "samples")
             ref_path = None
-            if os.path.isdir(samples_dir):
-                for name in sorted(os.listdir(samples_dir)):
+            if os.path.isdir(SAMPLES_DIR):
+                for name in sorted(os.listdir(SAMPLES_DIR)):
                     if name.lower().endswith(".wav"):
-                        ref_path = os.path.join(samples_dir, name)
+                        ref_path = os.path.join(SAMPLES_DIR, name)
                         break
             if not ref_path or not os.path.isfile(ref_path):
                 print("[prewarm] No WAV samples found; running warmup without clone_voice.", flush=True)
@@ -134,6 +225,15 @@ def list_samples() -> list[str]:
 
 
 @mcp.tool()
+def sample_path(sample_name: str) -> str:
+    """Return the absolute WAV path for a saved sample name."""
+    path = _sample_audio_path(sample_name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"sample not found: {sample_name!r}")
+    return path
+
+
+@mcp.tool()
 def synthesize_tts(
     text: str,
     ref_audio_path: str,
@@ -160,8 +260,7 @@ def synthesize_tts(
     """
     if not text.strip():
         raise ValueError("text must not be empty")
-    if not ref_audio_path or not os.path.isfile(ref_audio_path):
-        raise FileNotFoundError(f"ref_audio_path not found: {ref_audio_path!r}")
+    ref_audio_path = _safe_audio_path(ref_audio_path)
 
     with _init_lock:
         wav_path, message = _app().clone_voice(
@@ -194,8 +293,7 @@ def transcribe_audio(
         model_size: tiny | base | small | medium | large-v3 (any faster-whisper size).
         language: One of WHISPER_LANGS keys (e.g. 'English', 'Auto') or 'Auto'.
     """
-    if not audio_path or not os.path.isfile(audio_path):
-        raise FileNotFoundError(f"audio_path not found: {audio_path!r}")
+    audio_path = _safe_audio_path(audio_path)
     return _app().transcribe_only(
         audio_path=audio_path,
         model_size=model_size,
@@ -211,13 +309,15 @@ def fix_audio(
     to_mono: bool = True,
 ) -> str:
     """Normalize volume / convert to mono in-place. Returns the path."""
-    if not audio_path or not os.path.isfile(audio_path):
-        raise FileNotFoundError(f"audio_path not found: {audio_path!r}")
-    return _app().fix_audio_single(
+    audio_path = _safe_audio_path(audio_path, writable=True)
+    fixed_path, message = _app().fix_audio_single(
         audio_path=audio_path,
         normalize=normalize,
         to_mono=to_mono,
     )
+    if str(message).lower().startswith("error"):
+        raise RuntimeError(message)
+    return fixed_path
 
 
 @mcp.tool()
@@ -230,16 +330,15 @@ def save_sample(
 
     Returns the saved sample name on success.
     """
-    if not audio_path or not os.path.isfile(audio_path):
-        raise FileNotFoundError(f"audio_path not found: {audio_path!r}")
-    if not sample_name.strip():
-        raise ValueError("sample_name must not be empty")
+    audio_path = _safe_audio_path(audio_path)
+    sample_name = _clean_sample_name(sample_name)
     message = _app().save_prep_sample(
         audio_path=audio_path,
         sample_name=sample_name,
         transcription=transcription,
     )
-    if not message or "Error" in str(message) or "error" in str(message):
+    message_text = str(message)
+    if not message_text or "error" in message_text.lower():
         raise RuntimeError(message or "save_prep_sample failed")
     return sample_name
 
@@ -247,11 +346,13 @@ def save_sample(
 @mcp.tool()
 def delete_sample(sample_name: str) -> str:
     """Delete a saved voice sample by name."""
-    if not sample_name.strip():
-        raise ValueError("sample_name must not be empty")
+    sample_name = _clean_sample_name(sample_name)
     message = _app().delete_sample(sample_name=sample_name)
     if not message or "Error" in str(message):
         raise RuntimeError(message or "delete_sample failed")
+    json_path = os.path.join(SAMPLES_DIR, f"{sample_name}.json")
+    if os.path.exists(json_path):
+        os.remove(json_path)
     return sample_name
 
 
@@ -318,12 +419,12 @@ def dialogue(
     for i, seg in enumerate(parsed):
         if not isinstance(seg, dict):
             raise ValueError(f"segments[{i}] must be a dict with 'sample' and 'text'")
-        sample = (seg.get("sample") or "").strip()
+        sample = _clean_sample_name(seg.get("sample") or "")
         text = (seg.get("text") or "").strip()
-        if not sample:
-            raise ValueError(f"segments[{i}].sample missing")
         if not text:
             raise ValueError(f"segments[{i}].text missing")
+        if not os.path.isfile(_sample_audio_path(sample)):
+            raise FileNotFoundError(f"segments[{i}].sample not found: {sample!r}")
         cleaned.append((sample, text))
 
     pad = _DIALOGUE_MAX - len(cleaned)
@@ -351,8 +452,23 @@ def dialogue(
     return wav_path
 
 
+def _build_http_app(transport: str, username: str, password: str):
+    if transport == "sse":
+        app = mcp.sse_app()
+    else:
+        app = mcp.streamable_http_app()
+    app.add_middleware(BasicAuthMiddleware, username=username, password=password)
+    return app
+
+
+def _run_http(transport: str, host: str, port: int, username: str, password: str):
+    import uvicorn
+
+    app = _build_http_app(transport, username, password)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
-    import argparse
 
     parser = argparse.ArgumentParser(description="Fish Speech S2 Pro MCP server")
     parser.add_argument("--transport", choices=("stdio", "sse", "streamable-http"),
@@ -360,6 +476,11 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=os.environ.get("FISH_MCP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("FISH_MCP_PORT", "8765")))
+    parser.add_argument("--username", default=os.environ.get("FISH_MCP_USERNAME", "fish"))
+    parser.add_argument("--password-env", default="FISH_MCP_PASSWORD",
+                        help="Environment variable containing the HTTP Basic auth password.")
+    parser.add_argument("--allow-no-auth", action="store_true",
+                        help="Allow HTTP/SSE without a password. Only use on trusted local networks.")
     parser.add_argument("--no-prewarm", action="store_true",
                         help="Skip the startup pre-warm of the PyTorch model.")
     args = parser.parse_args()
@@ -372,4 +493,11 @@ if __name__ == "__main__":
     else:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-        mcp.run(transport=args.transport)
+        password = os.environ.get(args.password_env, "")
+        if not password and not args.allow_no_auth:
+            sys.stderr.write(f"Set {args.password_env} before exposing HTTP MCP, or pass --allow-no-auth.\n")
+            sys.exit(2)
+        if password:
+            _run_http(args.transport, args.host, args.port, args.username, password)
+        else:
+            mcp.run(transport=args.transport)
