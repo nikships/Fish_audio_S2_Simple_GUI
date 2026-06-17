@@ -280,7 +280,6 @@ GGUF_MODELS = {
 CUDA_NATIVE_MODELS = {"s2-pro-f16.gguf", "s2-pro-q8_0.gguf"}
 
 # --- Engine Names ---
-ENGINE_CPP = "Fish Speech S2 Pro (CPP) (VRAM Efficient - Slower)"
 ENGINE_PYTORCH = "Fish Speech S2 Pro (PyTorch) (Fastest - 24GB+ VRAM only)"
 
 WHISPER_LANGS = {
@@ -677,7 +676,7 @@ def write_synthesized_audio(path, audio_data, sample_rate):
     sf.write(path, dual_mono, sample_rate, subtype="PCM_16")
 
 
-def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
+def clone_voice(trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
     global s2_process, s2_current_model, s2_current_codec_cuda
 
     if not text:
@@ -691,7 +690,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
     # Calculate auto tokens based on target text length dynamically
     expected_new_tokens = int(len(text) * 4.5)
     
-    if engine == ENGINE_CPP:
+    if False:  # CPP engine removed; only PyTorch path remains below.
         cpp_exec, checked_paths = find_s2_executable()
         if not cpp_exec:
             return None, format_s2_not_found_error(checked_paths)
@@ -992,7 +991,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
             
         return None, f"s2.cpp REST API Error:\n{error_msg}"
             
-    elif engine == ENGINE_PYTORCH:
+    else:  # Always PyTorch:
         # Auto-Unload CPP Server if switching to PyTorch
         if s2_process is not None:
             print("Auto-Unloading CPP Server to free VRAM for PyTorch...")
@@ -1035,7 +1034,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
 
     return None, "Engine not supported."
 
-def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
+def generate_dialogue(trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
     # args is [sample1, ..., sample20, text1, ..., text20]
     num_max = 20 # Should match MAX_DIALOGUE_SEGMENTS
     samples = args[:num_max]
@@ -1065,7 +1064,7 @@ def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, t
             
         # Generate
         wav_path, status = clone_voice(
-            engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text,
+            trained_model_select, text, ref_audio, ref_text,
             top_p, top_k, temp, rep_pen, split_para, progress=progress
         )
         
@@ -1856,21 +1855,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
     with gr.Tabs(elem_id="main-tabs"):
         with gr.Tab("Voice Clone", id="tab_voice_clone"):
             gr.Markdown("Clone Voices from Samples. <small>(Use Prep Samples to add samples)</small>")
-            
-            def update_engine_ui(engine):
-                is_cpp = (engine == ENGINE_CPP)
-                if is_cpp:
-                    return (
-                        gr.update(visible=True),
-                        gr.update(visible=False),
-                        gr.update(),
-                    )
-                else:
-                    return (
-                        gr.update(visible=False),
-                        gr.update(visible=True),
-                        gr.update(value=False),
-                    )
 
             def update_split_count(text):
                 if not text: return "### ✂️ Splits\n**0** Clips"
@@ -1881,36 +1865,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
             # --- Global Settings at Top ---
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### ⚙️ Inference & Models")
-                    engine_dropdown = gr.Dropdown(
-                        choices=[ENGINE_CPP, ENGINE_PYTORCH],
-                        value=ENGINE_CPP,
-                        label="Inference Engine"
-                    )
-                    cpp_model_row = gr.Column(visible=True)
-                    with cpp_model_row:
-                        with gr.Row():
-                            cpp_model_dropdown = gr.Dropdown(
-                                choices=list(GGUF_MODELS.keys()), 
-                                label="GGUF Model", 
-                                value=list(GGUF_MODELS.keys())[1]
-                            )
-                        with gr.Row():
-                            codec_cuda_check = gr.Checkbox(
-                                label="CUDA Reference Encoder (Experimental)",
-                                value=False,
-                                info="Accelerates sample encoding on CUDA while keeping waveform decoding on the faster CPU path. Uses additional VRAM."
-                            )
+                    gr.Markdown("### ⚙️ Inference & Models (PyTorch only)")
                     with gr.Row():
-                        trained_model_row = gr.Row(visible=False)
-                        with trained_model_row:
-                            trained_model_dropdown = gr.Dropdown(
-                                choices=get_trained_models(),
-                                label="Trained LoRA Model",
-                                value="Base Model (Fish S2 Pro)",
-                                scale=10
-                            )
-                            trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
+                        trained_model_dropdown = gr.Dropdown(
+                            choices=get_trained_models(),
+                            label="Trained LoRA Model",
+                            value="Base Model (Fish S2 Pro)",
+                            scale=10
+                        )
+                        trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
 
                 with gr.Column(scale=1):
                     gr.Markdown("### 🛠️ Advanced Settings")
@@ -2148,13 +2111,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
 
                     # 2. Main Generation Logic
-                    engine_dropdown.change(
-                        fn=update_engine_ui,
-                        inputs=engine_dropdown,
-                        outputs=[cpp_model_row, trained_model_row, codec_cuda_check],
-                        queue=False,
-                        show_progress="hidden",
-                    )
 
                     target_text.change(
                         fn=update_split_count,
@@ -2172,7 +2128,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
                     generate_btn.click(
                         fn=clone_voice,
-                        inputs=[engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
+                        inputs=[trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
                         outputs=[output_audio, clone_status]
                     )
 
@@ -2201,7 +2157,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     generate_dialogue_btn.click(
                         fn=generate_dialogue,
                         inputs=[
-                            engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown,
+                            trained_model_dropdown,
                             top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check,
                             dialogue_row_count, dialogue_silence_slider,
                             *all_samples_ui,
